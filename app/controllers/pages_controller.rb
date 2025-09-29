@@ -60,11 +60,13 @@ class PagesController < ApplicationController
   def build_cashflow_sankey_data(income_totals, expense_totals, currency_symbol)
     nodes = []
     links = []
-    node_indices = {}
+    node_indices = {} # Memoize node indices by a unique key: "type_categoryid"
 
+    # Helper to add/find node and return its index
     add_node = ->(unique_key, display_name, value, percentage, color) {
       node_indices[unique_key] ||= begin
         nodes << {
+          key: unique_key, # keep key for index remapping later
           name: display_name,
           value: value.to_f.round(2),
           percentage: percentage.to_f.round(1),
@@ -74,8 +76,59 @@ class PagesController < ApplicationController
       end
     }
 
+    # Helper to detect "Uncategorized"
+    is_uncategorized = ->(cat) do
+      return false unless cat
+      (cat.respond_to?(:uncategorized?) && cat.uncategorized?) ||
+        cat.name.to_s.strip.casecmp("uncategorized").zero? ||
+        cat.name.to_s.strip.casecmp("uncategorised").zero?
+    end
+
     total_income_val = income_totals.total.to_f.round(2)
     total_expense_val = expense_totals.total.to_f.round(2)
+
+    # Gather category aggregates
+    by_cat = Hash.new { |h, k| h[k] = { category: nil, income: 0.0, expense: 0.0 } }
+    uncat_income_total  = 0.0
+    uncat_expense_total = 0.0
+    uncat_income_meta   = { name: "Uncategorized", color: Category::COLORS.sample }
+    uncat_expense_meta  = { name: "Uncategorized", color: Category::UNCATEGORIZED_COLOR }
+
+    # Income side
+    income_totals.category_totals.each do |ct|
+      next if ct.category.parent_id.present?
+      val = ct.total.to_f.round(2)
+      next if val.zero?
+
+      if is_uncategorized.call(ct.category)
+        uncat_income_total += val
+        uncat_income_meta[:name]  = ct.category.name if ct.category&.name.present?
+        uncat_income_meta[:color] = ct.category.color if ct.category&.color.present?
+        next
+      end
+
+      entry = by_cat[ct.category.id]
+      entry[:category] ||= ct.category
+      entry[:income] += val
+    end
+
+    # Expense side
+    expense_totals.category_totals.each do |ct|
+      next if ct.category.parent_id.present?
+      val = ct.total.to_f.round(2)
+      next if val.zero?
+
+      if is_uncategorized.call(ct.category)
+        uncat_expense_total += val
+        uncat_expense_meta[:name]  = ct.category.name if ct.category&.name.present?
+        uncat_expense_meta[:color] = ct.category.color if ct.category&.color.present?
+        next
+      end
+
+      entry = by_cat[ct.category.id]
+      entry[:category] ||= ct.category
+      entry[:expense] += val
+    end
 
     # --- Create Central Cash Flow Node ---
     cash_flow_idx = add_node.call(
@@ -86,60 +139,127 @@ class PagesController < ApplicationController
       "var(--color-success)"
     )
 
-    # --- Combine income + expenses per category ---
-    net_by_cat = Hash.new { |h, k| h[k] = 0.0 }
-    cats = {}
+    # --- Process Net Per Category (excluding Uncategorized) ---
+    by_cat.each_value do |entry|
+      cat = entry[:category]
+      net = (entry[:income] - entry[:expense]).round(2)
+      next if net.zero?
 
-    income_totals.category_totals.each do |ct|
-      next if ct.category.parent_id.present?
-      net_by_cat[ct.category.id] += ct.total.to_f
-      cats[ct.category.id] ||= ct.category
-    end
+      node_color = cat.color.presence || Category::COLORS.sample
+      net_abs = net.abs
 
-    expense_totals.category_totals.each do |ct|
-      next if ct.category.parent_id.present?
-      net_by_cat[ct.category.id] -= ct.total.to_f
-      cats[ct.category.id] ||= ct.category
-    end
-
-    total_net_income = net_by_cat.values.select { |v| v > 0 }.sum.round(2)
-    total_net_expense = net_by_cat.values.select { |v| v < 0 }.map(&:abs).sum.round(2)
-
-    # --- Process combined categories ---
-    net_by_cat.each do |cat_id, net_val|
-      category = cats[cat_id]
-      val = net_val.round(2)
-      next if val.zero?
-
-      if val > 0
-        percentage = total_net_income.zero? ? 0 : (val / total_net_income * 100).round(1)
-        node_color = category.color.presence || Category::COLORS.sample
-        idx = add_node.call("income_#{cat_id}", category.name, val, percentage, node_color)
-        links << { source: idx, target: cash_flow_idx, value: val, color: node_color, percentage: percentage }
+      if net.positive?
+        perc = total_income_val.zero? ? 0 : (net_abs / total_income_val * 100).round(1)
+        idx = add_node.call("net_#{cat.id}", cat.name, net_abs, perc, node_color)
+        links << {
+          source: idx,
+          target: cash_flow_idx,
+          value: net_abs,
+          color: node_color,
+          percentage: perc
+        }
       else
-        positive_val = val.abs
-        percentage = total_net_expense.zero? ? 0 : (positive_val / total_net_expense * 100).round(1)
-        node_color = category.color.presence || Category::UNCATEGORIZED_COLOR
-        idx = add_node.call("expense_#{cat_id}", category.name, positive_val, percentage, node_color)
-        links << { source: cash_flow_idx, target: idx, value: positive_val, color: node_color, percentage: percentage }
+        perc = total_expense_val.zero? ? 0 : (net_abs / total_expense_val * 100).round(1)
+        idx = add_node.call("net_#{cat.id}", cat.name, net_abs, perc, node_color)
+        links << {
+          source: cash_flow_idx,
+          target: idx,
+          value: net_abs,
+          color: node_color,
+          percentage: perc
+        }
       end
     end
 
-    # --- Surplus ---
-    leftover = (total_net_income - total_net_expense).round(2)
-    if leftover.positive?
-      percentage = total_net_income.zero? ? 0 : (leftover / total_net_income * 100).round(1)
-      surplus_idx = add_node.call("surplus_node", "Surplus", leftover, percentage, "var(--color-success)")
-      links << { source: cash_flow_idx, target: surplus_idx, value: leftover, color: "var(--color-success)", percentage: percentage }
+    # --- Keep Uncategorized separate ---
+    if uncat_income_total.positive?
+      perc = total_income_val.zero? ? 0 : (uncat_income_total / total_income_val * 100).round(1)
+      idx = add_node.call(
+        "income_uncategorized",
+        uncat_income_meta[:name],
+        uncat_income_total,
+        perc,
+        uncat_income_meta[:color]
+      )
+      links << {
+        source: idx,
+        target: cash_flow_idx,
+        value: uncat_income_total,
+        color: uncat_income_meta[:color],
+        percentage: perc
+      }
     end
 
-    # Update Cash Flow node %
-    nodes[node_indices["cash_flow_node"]][:percentage] = 100.0 if node_indices["cash_flow_node"]
+    if uncat_expense_total.positive?
+      perc = total_expense_val.zero? ? 0 : (uncat_expense_total / total_expense_val * 100).round(1)
+      idx = add_node.call(
+        "expense_uncategorized",
+        uncat_expense_meta[:name],
+        uncat_expense_total,
+        perc,
+        uncat_expense_meta[:color]
+      )
+      links << {
+        source: cash_flow_idx,
+        target: idx,
+        value: uncat_expense_total,
+        color: uncat_expense_meta[:color],
+        percentage: perc
+      }
+    end
 
-    {
-      nodes: nodes,
+    # --- Process Surplus ---
+    leftover = (total_income_val - total_expense_val).round(2)
+    if leftover.positive?
+      perc = total_income_val.zero? ? 0 : (leftover / total_income_val * 100).round(1)
+      surplus_idx = add_node.call(
+        "surplus_node",
+        "Surplus",
+        leftover,
+        perc,
+        "var(--color-success)"
+      )
+      links << {
+        source: cash_flow_idx,
+        target: surplus_idx,
+        value: leftover,
+        color: "var(--color-success)",
+        percentage: perc
+      }
+    end
+
+    # --- Sorting of nodes ---
+    # Cash Flow stays at top, Uncategorized next, Surplus last
+    nodes_sorted = nodes.sort_by do |n|
+      if n[:key] == "cash_flow_node"
+        [0, 0] # force first
+      elsif n[:key].to_s.include?("uncategorized")
+        [2, n[:value] * -1] # after others, group by value
+      elsif n[:key] == "surplus_node"
+        [3, n[:value] * -1] # very last
+      else
+        [1, -n[:value]] # normal categories sorted by descending value
+      end
+    end
+
+    # Reassign indices based on new ordering
+    key_to_new_idx = {}
+    nodes_sorted.each_with_index do |n, i|
+      key_to_new_idx[n[:key]] = i
+    end
+    links.each do |l|
+      l[:source] = key_to_new_idx[nodes[l[:source]][:key]]
+      l[:target] = key_to_new_idx[nodes[l[:target]][:key]]
+    end
+    nodes = nodes_sorted
+
+    # --- Fix Cash Flow percentage ---
+    if key_to_new_idx["cash_flow_node"]
+      nodes[key_to_new_idx["cash_flow_node"]][:percentage] = 100.0
+    end
+
+    { nodes: nodes,
       links: links,
-      currency_symbol: Money::Currency.new(currency_symbol).symbol
-    }
+      currency_symbol: Money::Currency.new(currency_symbol).symbol }
   end
 end
